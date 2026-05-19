@@ -1,0 +1,6 @@
+# Generated inventory exports
+*.csv
+
+# Temporary/debug outputs
+_debug_*.csv
+_verify_*.csv
