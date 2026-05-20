@@ -8,6 +8,9 @@ param(
 
     [Parameter(Mandatory = $false)]
     [switch]$SkipModuleInstall
+        ,
+        [Parameter(Mandatory = $false)]
+        [string]$SpecifyEnvironment
 )
 
 <#
@@ -1136,6 +1139,18 @@ $environments = & $environmentCommand.Name
 
 if (-not $environments) {
     throw "No environments found or you do not have sufficient permissions."
+}
+
+# If specifyEnvironment is set, filter environments to only that GUID
+if ($SpecifyEnvironment) {
+    $specEnvGuid = $SpecifyEnvironment.ToLowerInvariant()
+    $environments = @($environments | Where-Object {
+        $envId = [string](Get-ValueByPath -InputObject $_ -Paths @("EnvironmentName", "Name", "Id"))
+        $envId -and ($envId.ToLowerInvariant() -eq $specEnvGuid)
+    })
+    if (-not $environments -or $environments.Count -eq 0) {
+        throw "No environment found matching GUID: $SpecifyEnvironment"
+    }
 }
 
 $totalEnvironmentCount = @($environments).Count

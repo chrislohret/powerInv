@@ -29,6 +29,7 @@ Commonly used modules/cmdlets:
 - Microsoft.Graph.Authentication
 - Microsoft.Graph.Users
 - pac (Power Platform CLI, optional fallback path)
+-- Make sure to install from https://learn.microsoft.com/en-us/power-platform/developer/cli/introduction?tabs=windows
 
 ## Required Permissions
 
@@ -58,6 +59,7 @@ If running the script as an application/service principal (non-interactive), ens
 
 ## Usage
 
+
 Run from this repository folder:
 
 ```powershell
@@ -80,6 +82,18 @@ Disable automatic module installation:
 
 ```powershell
 .\Get-M365PowerPlatformInventory.ps1 -SkipModuleInstall
+```
+
+Process only a specific environment by GUID:
+
+```powershell
+.\Get-M365PowerPlatformInventory.ps1 -SpecifyEnvironment "<environment-guid>"
+```
+
+You can combine parameters as needed. For example, to process a single environment and include connection references:
+
+```powershell
+.\Get-M365PowerPlatformInventory.ps1 -SpecifyEnvironment "<environment-guid>" -IncludeConnectionReferences
 ```
 
 ## Output column dictionary
