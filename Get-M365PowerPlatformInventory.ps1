@@ -204,6 +204,23 @@ function Convert-ToConnectionReferenceSummary {
         }
     }
 
+    if ($Entries -is [System.Collections.IEnumerable] -and -not ($Entries -is [string]) -and -not ($Entries -is [System.Collections.IDictionary])) {
+        foreach ($entry in $Entries) {
+            $label = & $buildLabel $entry $null
+            & $addLabel $label
+        }
+
+        $listText = $null
+        if ($labels.Count -gt 0) {
+            $listText = [string]::Join("; ", $labels)
+        }
+
+        return [PSCustomObject]@{
+            Count = $labels.Count
+            List  = $listText
+        }
+    }
+
     $entryProperties = @($Entries.PSObject.Properties | Where-Object { $_.MemberType -in @("NoteProperty", "Property") })
     if ($entryProperties.Count -gt 0) {
         $singleEntryFields = @("displayName", "name", "id", "apiName", "connectionReferenceLogicalName")
@@ -231,12 +248,6 @@ function Convert-ToConnectionReferenceSummary {
         foreach ($key in $Entries.Keys) {
             $entry = $Entries[$key]
             $label = & $buildLabel $entry ([string]$key)
-            & $addLabel $label
-        }
-    }
-    elseif ($Entries -is [System.Collections.IEnumerable] -and -not ($Entries -is [string])) {
-        foreach ($entry in $Entries) {
-            $label = & $buildLabel $entry $null
             & $addLabel $label
         }
     }
@@ -337,7 +348,7 @@ function Get-FlowConnectionReferences {
     return (Get-ConnectionReferencesFromItem -Item $FlowItem)
 }
 
-# Builds an agent tool/action summary by extracting a PAC template and parsing connectors/actions.
+# Builds an agent tool/action summary from Dataverse botcomponent payloads.
 function Get-AgentToolSummary {
     param(
         [Parameter(Mandatory = $false)]
@@ -354,36 +365,21 @@ function Get-AgentToolSummary {
         }
     }
 
-    if ($null -eq (Get-PacCommand)) {
+    $normalizedUrl = $EnvironmentUrl.TrimEnd('/')
+    $token = Get-DataverseAccessToken -ResourceUrl $normalizedUrl
+    if ([string]::IsNullOrWhiteSpace($token)) {
         return [PSCustomObject]@{
             Count = 0
             List  = $null
         }
     }
 
-    $tempFolder = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ("pp_agent_tools_{0}" -f ([guid]::NewGuid().ToString("N")))
-    $templateYaml = Join-Path -Path $tempFolder -ChildPath "agent_template.yaml"
-
-    New-Item -Path $tempFolder -ItemType Directory -Force | Out-Null
-
     try {
-        $extractOutput = Invoke-PacCommandSafe -Arguments @(
-            "copilot",
-            "extract-template",
-            "--environment",
-            $EnvironmentUrl,
-            "--bot",
-            $AgentId,
-            "--templateFileName",
-            $templateYaml,
-            "--overwrite"
-        ) -TimeoutSeconds 90
-
-        if ($null -eq $extractOutput -or -not (Test-Path -Path $templateYaml)) {
-            return [PSCustomObject]@{
-                Count = 0
-                List  = $null
-            }
+        $headers = @{
+            "Authorization"    = "Bearer $token"
+            "Accept"           = "application/json"
+            "OData-MaxVersion" = "4.0"
+            "OData-Version"    = "4.0"
         }
 
         $toolLabels = [System.Collections.Generic.List[string]]::new()
@@ -399,52 +395,24 @@ function Get-AgentToolSummary {
             }
         }
 
-        $templateJsonFile = Get-ChildItem -Path $tempFolder -Filter "*.json" -ErrorAction SilentlyContinue |
-            Sort-Object -Property Name |
-            Select-Object -First 1
+        $componentUri = "$normalizedUrl/api/data/v9.2/botcomponents?`$select=content,data,_parentbotid_value&`$filter=_parentbotid_value eq $AgentId"
+        $components = @((Invoke-RestMethod -Uri $componentUri -Headers $headers -Method GET -ErrorAction Stop).value)
 
-        if ($null -ne $templateJsonFile) {
-            try {
-                $templateJson = Get-Content -Path $templateJsonFile.FullName -Raw | ConvertFrom-Json
-                $connectors = @($templateJson.spec.connectors)
-
-                foreach ($connector in $connectors) {
-                    if ($connector -is [string]) {
-                        & $addTool ("connector:{0}" -f $connector)
-                        continue
-                    }
-
-                    $connectorName = [string](Get-ValueByPath -InputObject $connector -Paths @(
-                            "displayName",
-                            "name",
-                            "id",
-                            "connectorId"
-                        ))
-
-                    if (-not [string]::IsNullOrWhiteSpace($connectorName)) {
-                        & $addTool ("connector:{0}" -f $connectorName)
-                    }
-                }
+        foreach ($component in $components) {
+            $contentBlob = ([string]$component.content + "`n" + [string]$component.data)
+            if ([string]::IsNullOrWhiteSpace($contentBlob)) {
+                continue
             }
-            catch {
-            }
-        }
 
-        try {
-            $yamlText = Get-Content -Path $templateYaml -Raw
-            $matches = [regex]::Matches($yamlText, "(?m)^\s*-\s*kind:\s*([A-Za-z0-9_]+)\s*$")
-            foreach ($match in $matches) {
-                $kind = [string]$match.Groups[1].Value
+            $kindMatches = [regex]::Matches($contentBlob, "(?i)\b(?:SearchAndSummarizeContent|Invoke[A-Za-z0-9]+(?:Action|TaskAction|MCP)|HttpRequestAction|GotoAction|PCFControlAction)\b")
+            foreach ($kindMatch in $kindMatches) {
+                $kind = [string]$kindMatch.Value
                 if ([string]::IsNullOrWhiteSpace($kind)) {
                     continue
                 }
 
-                if ($kind -match "Invoke|Connector|Flow|Plugin|Mcp|Http|Search|Knowledge|Action") {
-                    & $addTool ("action:{0}" -f $kind)
-                }
+                & $addTool ("action:{0}" -f $kind)
             }
-        }
-        catch {
         }
 
         $listText = $null
@@ -457,8 +425,11 @@ function Get-AgentToolSummary {
             List  = $listText
         }
     }
-    finally {
-        Remove-Item -Path $tempFolder -Recurse -Force -ErrorAction SilentlyContinue
+    catch {
+        return [PSCustomObject]@{
+            Count = 0
+            List  = $null
+        }
     }
 }
 
@@ -855,6 +826,56 @@ function Get-DataverseBotOwnerMap {
     return $map
 }
 
+# Queries Dataverse bots and returns agent inventory records for an environment.
+function Get-DataverseBots {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$InstanceUrl
+    )
+
+    $bots = [System.Collections.Generic.List[object]]::new()
+    $normalizedUrl = $InstanceUrl.TrimEnd('/')
+    $token = Get-DataverseAccessToken -ResourceUrl $normalizedUrl
+
+    if ([string]::IsNullOrWhiteSpace($token)) {
+        return $bots
+    }
+
+    try {
+        $headers = @{
+            "Authorization"    = "Bearer $token"
+            "Accept"           = "application/json"
+            "OData-MaxVersion" = "4.0"
+            "OData-Version"    = "4.0"
+            "Prefer"           = "odata.include-annotations=`"OData.Community.Display.V1.FormattedValue`""
+        }
+
+        $nextUri = "$normalizedUrl/api/data/v9.2/bots?`$select=botid,name,_ownerid_value,createdon&`$top=5000"
+        while (-not [string]::IsNullOrWhiteSpace($nextUri)) {
+            $response = Invoke-RestMethod -Uri $nextUri -Headers $headers -Method GET -ErrorAction Stop
+
+            foreach ($bot in $response.value) {
+                $ownerDisplayValue = $bot.PSObject.Properties["_ownerid_value@OData.Community.Display.V1.FormattedValue"]
+                $bots.Add([PSCustomObject]@{
+                        BotId             = [string]$bot.botid
+                        Name              = [string]$bot.name
+                        OwnerSystemUserId = [string]$bot."_ownerid_value"
+                        OwnerDisplayName  = if ($null -ne $ownerDisplayValue) { [string]$ownerDisplayValue.Value } else { $null }
+                        CreatedOn         = [string]$bot.createdon
+                    }) | Out-Null
+            }
+
+            $nextUri = $null
+            if ($response.PSObject.Properties['@odata.nextLink']) {
+                $nextUri = [string]$response.'@odata.nextLink'
+            }
+        }
+    }
+    catch { }
+
+    return $bots
+}
+
 # Resolves a Dataverse system user email and caches results by environment+user key.
 function Resolve-DataverseSystemUserEmail {
     param(
@@ -1117,6 +1138,9 @@ if (-not $environments) {
     throw "No environments found or you do not have sufficient permissions."
 }
 
+$totalEnvironmentCount = @($environments).Count
+$processedEnvironmentCount = 0
+
 $inventory = [System.Collections.Generic.List[object]]::new()
 $flowCount = 0
 $appCount = 0
@@ -1164,6 +1188,7 @@ else {
 
 # Iterate environments and collect Flow/App/Agent artifacts.
 foreach ($environment in $environments) {
+    $processedEnvironmentCount++
     $environmentId = [string](Get-ValueByPath -InputObject $environment -Paths @("EnvironmentName", "Name", "Id"))
     $environmentDisplayName = [string](Get-ValueByPath -InputObject $environment -Paths @("DisplayName", "EnvironmentDisplayName"))
     $environmentInstanceUrl = [string](Get-ValueByPath -InputObject $environment -Paths @("Internal.properties.linkedEnvironmentMetadata.instanceUrl"))
@@ -1172,7 +1197,11 @@ foreach ($environment in $environments) {
         $environmentDisplayName = $environmentId
     }
 
-    Write-Host "Processing environment: $environmentDisplayName" -ForegroundColor Gray
+    $percentComplete = [int](($processedEnvironmentCount / $totalEnvironmentCount) * 100)
+    $environmentStatus = "Currently processing environment $processedEnvironmentCount of ${totalEnvironmentCount}: $environmentDisplayName"
+
+    Write-Progress -Activity "Collecting Power Platform inventory" -Status $environmentStatus -PercentComplete $percentComplete
+    Write-Host $environmentStatus -ForegroundColor Gray
 
     try {
         $flows = Get-AdminFlow -EnvironmentName $environmentId
@@ -1311,36 +1340,18 @@ foreach ($environment in $environments) {
                 continue
             }
 
-            $pacOutput = Invoke-PacCommandSafe -Arguments @("copilot", "list", "--environment", $instanceUrl) -TimeoutSeconds 45
-            if ($null -eq $pacOutput) {
-                Write-Warning "PAC agent query timed out for environment '$environmentDisplayName'."
-                continue
-            }
+            $dataverseBots = @(Get-DataverseBots -InstanceUrl $instanceUrl)
+            $dvEnrichmentAvailable = @($dataverseBots).Count -gt 0
 
-            $pacAgents = @(Parse-PacCopilotListOutput -OutputText $pacOutput)
-
-            # Attempt to enrich owner/date via Dataverse Web API (requires Az.Accounts for token acquisition)
-            $dvBotOwnerMap = Get-DataverseBotOwnerMap -InstanceUrl $instanceUrl
-            $dvEnrichmentAvailable = $dvBotOwnerMap.Count -gt 0
-
-            foreach ($agent in $pacAgents) {
-                $agentGuid = [string]$agent.CopilotId
+            foreach ($agent in $dataverseBots) {
+                $agentGuid = [string]$agent.BotId
                 $ownerEmail = $null
-                $ownerDisplayName = $null
-                $ownerObjectId = $null
-                $created = $null
+                $ownerDisplayName = [string]$agent.OwnerDisplayName
+                $ownerObjectId = [string]$agent.OwnerSystemUserId
+                $created = Convert-ToIsoDate $agent.CreatedOn
 
-                if ($dvEnrichmentAvailable) {
-                    $dvEntry = $dvBotOwnerMap[$agentGuid.ToLowerInvariant()]
-                    if ($null -ne $dvEntry) {
-                        $ownerDisplayName = [string]$dvEntry.OwnerDisplayName
-                        $created = Convert-ToIsoDate $dvEntry.CreatedOn
-
-                        $ownerObjectId = [string]$dvEntry.OwnerSystemUserId
-                        if (-not [string]::IsNullOrWhiteSpace($ownerObjectId)) {
-                            $ownerEmail = Resolve-DataverseSystemUserEmail -InstanceUrl $instanceUrl -SystemUserId $ownerObjectId
-                        }
-                    }
+                if (-not [string]::IsNullOrWhiteSpace($ownerObjectId)) {
+                    $ownerEmail = Resolve-DataverseSystemUserEmail -InstanceUrl $instanceUrl -SystemUserId $ownerObjectId
                 }
 
                 $ownerValue = Resolve-OwnerField -OwnerDisplayName $ownerDisplayName -OwnerEmail $ownerEmail
@@ -1361,16 +1372,18 @@ foreach ($environment in $environments) {
                 $agentCount++
             }
 
-            if (@($pacAgents).Count -gt 0 -and -not $dvEnrichmentAvailable -and -not $pacFallbackOwnerDateMissingWarningShown) {
-                Write-Warning "PAC fallback owner/date enrichment via Dataverse was not available (Az.Accounts module with active login may be required). Agent Owner/OwnerEmail/DateCreated may be blank."
+            if (-not $dvEnrichmentAvailable -and -not $pacFallbackOwnerDateMissingWarningShown) {
+                Write-Warning "Dataverse fallback agent inventory was not available (Az.Accounts module with active login may be required). Agent artifacts may be missing."
                 $pacFallbackOwnerDateMissingWarningShown = $true
             }
         }
         catch {
-            Write-Warning "Failed to collect agents through PAC for environment '$environmentDisplayName'. $($_.Exception.Message)"
+            Write-Warning "Failed to collect agents through Dataverse fallback for environment '$environmentDisplayName'. $($_.Exception.Message)"
         }
     }
 }
+
+Write-Progress -Activity "Collecting Power Platform inventory" -Completed
 
 # Handle agent cmdlets that only support tenant-level enumeration (no environment filter).
 if ($null -ne $agentCommand -and -not $agentSupportsEnvironment) {
@@ -1437,9 +1450,37 @@ if (-not [string]::IsNullOrWhiteSpace($outputDirectory) -and -not (Test-Path -Pa
     New-Item -Path $outputDirectory -ItemType Directory -Force | Out-Null
 }
 
-$inventory |
-Sort-Object -Property ArtifactType, Environment, GUID |
-Export-Csv -Path $OutputCsvPath -NoTypeInformation -Encoding UTF8
+$sortedInventory = $inventory | Sort-Object -Property ArtifactType, Environment, GUID
+$maxConnectionReferenceCount = @($sortedInventory | ForEach-Object { [int]$_.ConnectionReferenceCount } | Measure-Object -Maximum).Maximum
+
+$exportRows = foreach ($item in $sortedInventory) {
+    $exportRecord = [ordered]@{
+        ArtifactType = $item.ArtifactType
+        Environment = $item.Environment
+        EnvironmentId = $item.EnvironmentId
+        GUID = $item.GUID
+        ArtifactName = $item.ArtifactName
+        Owner = $item.Owner
+        OwnerEmail = $item.OwnerEmail
+        OwnerObjectId = $item.OwnerObjectId
+        DateCreated = $item.DateCreated
+        ConnectionReferenceCount = $item.ConnectionReferenceCount
+    }
+
+    $referenceValues = @()
+    if (-not [string]::IsNullOrWhiteSpace([string]$item.ConnectionReferences)) {
+        $referenceValues = @([string]$item.ConnectionReferences -split '\s*;\s*' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    }
+
+    for ($index = 1; $index -le $maxConnectionReferenceCount; $index++) {
+        $columnName = "ConnectionReference{0}" -f $index
+        $exportRecord[$columnName] = if ($index -le $referenceValues.Count) { $referenceValues[$index - 1] } else { $null }
+    }
+
+    [PSCustomObject]$exportRecord
+}
+
+$exportRows | Export-Csv -Path $OutputCsvPath -NoTypeInformation -Encoding UTF8
 
 Write-Host "Inventory complete." -ForegroundColor Green
 Write-Host "Flows:  $flowCount" -ForegroundColor Green
