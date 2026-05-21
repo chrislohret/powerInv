@@ -84,6 +84,19 @@ Disable automatic module installation:
 .\Get-M365PowerPlatformInventory.ps1 -SkipModuleInstall
 ```
 
+Skip Dataverse agent discovery and use PAC CLI directly for agent discovery:
+
+```powershell
+.\Get-M365PowerPlatformInventory.ps1 -SkipAgentDataverseQuery
+```
+
+When `-SkipAgentDataverseQuery` is used, agent discovery runs in strict PAC mode:
+
+- Agent rows are sourced from `pac copilot list` only
+- Dataverse-based agent discovery/enrichment queries are skipped
+- Owner/owner-email/date fields for Agents may be reduced or blank when PAC output does not expose that metadata
+- If `-IncludeConnectionReferences` is also used, agent tool/action extraction may still return data when the PAC/template path succeeds
+
 Process only a specific environment by GUID:
 
 ```powershell
@@ -95,6 +108,37 @@ You can combine parameters as needed. For example, to process a single environme
 ```powershell
 .\Get-M365PowerPlatformInventory.ps1 -SpecifyEnvironment "<environment-guid>" -IncludeConnectionReferences
 ```
+
+You can also combine the PAC-only agent discovery mode:
+
+```powershell
+.\Get-M365PowerPlatformInventory.ps1 -IncludeConnectionReferences -SkipAgentDataverseQuery
+```
+
+## Run Summary Output
+
+At the end of execution, the script prints a summary to the console:
+
+- Flows count
+- Apps count
+- Agents count
+- Total row count
+- CSV output path
+
+When environment access/connectivity/security issues are detected, an additional section is printed:
+
+```text
+Environment access issues:
+- <EnvironmentDisplayName> [<Stage>]: <Message>
+```
+
+Where `<Stage>` indicates the pipeline step that failed. Common stages include:
+
+- `DataverseOwnerMap`
+- `DataverseAgentDiscovery`
+- `PacCopilotList`
+
+This summary is intended to help you quickly identify environments that were partially processed due to permissions or connectivity problems.
 
 ## Output column dictionary
 
