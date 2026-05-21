@@ -10,7 +10,10 @@ param(
     [switch]$SkipModuleInstall
         ,
         [Parameter(Mandatory = $false)]
-        [string]$SpecifyEnvironment
+    [string]$SpecifyEnvironment,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$SkipAgentDataverseQuery
 )
 
 <#
@@ -33,6 +36,9 @@ How to run:
 4. Run without auto-installing missing modules:
     .\Get-M365PowerPlatformInventory.ps1 -SkipModuleInstall
 
+5. Skip Dataverse agent discovery and use PAC directly:
+    .\Get-M365PowerPlatformInventory.ps1 -SkipAgentDataverseQuery
+
 Parameters:
 - OutputCsvPath (string)
   Path to the CSV output file. Defaults to M365_PowerPlatform_Inventory_yyyyMMdd_HHmmss.csv in the current folder.
@@ -42,6 +48,9 @@ Parameters:
 
 - SkipModuleInstall (switch)
   When set, missing modules are not installed automatically and the script errors if required modules are absent.
+
+- SkipAgentDataverseQuery (switch)
+    When set (and PAC fallback is active), bypasses all Dataverse-based agent queries and uses `pac copilot list --environment` directly.
 
 PowerShell cmdlets and commands used:
 - Module/bootstrap: Get-Module, Install-Module, Import-Module, Get-Command
@@ -789,7 +798,10 @@ function Get-DataverseAccessToken {
 function Get-DataverseBotOwnerMap {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$InstanceUrl
+        [string]$InstanceUrl,
+
+        [Parameter(Mandatory = $false)]
+        [string]$EnvironmentDisplayName
     )
 
     $map = @{}
@@ -824,7 +836,16 @@ function Get-DataverseBotOwnerMap {
             }
         }
     }
-    catch { }
+    catch {
+        $errorMessage = $_.Exception.Message
+        if ([string]::IsNullOrWhiteSpace($errorMessage)) {
+            $errorMessage = "Dataverse bot owner map query failed."
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($EnvironmentDisplayName)) {
+            Add-EnvironmentAccessIssue -Environment $EnvironmentDisplayName -Stage "DataverseOwnerMap" -Message $errorMessage
+        }
+    }
 
     return $map
 }
@@ -833,7 +854,10 @@ function Get-DataverseBotOwnerMap {
 function Get-DataverseBots {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$InstanceUrl
+        [string]$InstanceUrl,
+
+        [Parameter(Mandatory = $false)]
+        [string]$EnvironmentDisplayName
     )
 
     $bots = [System.Collections.Generic.List[object]]::new()
@@ -874,9 +898,48 @@ function Get-DataverseBots {
             }
         }
     }
-    catch { }
+    catch {
+        $errorMessage = $_.Exception.Message
+        Write-Warning "Dataverse agent discovery failed for '$normalizedUrl'. $errorMessage"
+        if (-not [string]::IsNullOrWhiteSpace($EnvironmentDisplayName)) {
+            Add-EnvironmentAccessIssue -Environment $EnvironmentDisplayName -Stage "DataverseAgentDiscovery" -Message $errorMessage
+        }
+    }
 
     return $bots
+}
+
+# Records environment access/connectivity failures for the end-of-run summary.
+function Add-EnvironmentAccessIssue {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Environment,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Stage,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Message
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Environment) -or [string]::IsNullOrWhiteSpace($Message)) {
+        return
+    }
+
+    $normalizedMessage = $Message.Trim()
+    if ([string]::IsNullOrWhiteSpace($normalizedMessage)) {
+        return
+    }
+
+    $issueKey = "{0}|{1}|{2}" -f $Environment.ToLowerInvariant(), $Stage.ToLowerInvariant(), $normalizedMessage.ToLowerInvariant()
+    if (-not $script:environmentAccessIssueKeys.Contains($issueKey)) {
+        $script:environmentAccessIssueKeys.Add($issueKey) | Out-Null
+        $script:environmentAccessIssues.Add([PSCustomObject]@{
+                Environment = $Environment
+                Stage       = $Stage
+                Message     = $normalizedMessage
+            }) | Out-Null
+    }
 }
 
 # Resolves a Dataverse system user email and caches results by environment+user key.
@@ -924,25 +987,6 @@ function Resolve-DataverseSystemUserEmail {
         $script:dataverseSystemUserEmailCache[$cacheKey] = $null
         return $null
     }
-}
-
-# Finds the first supported PowerShell cmdlet for retrieving Copilot Studio agents.
-function Get-AgentCommand {
-    $candidateCommands = @(
-        "Get-AdminPowerVirtualAgent",
-        "Get-AdminPowerVirtualAgents",
-        "Get-AdminCopilotStudioAgent",
-        "Get-AdminPowerAppCopilot"
-    )
-
-    foreach ($commandName in $candidateCommands) {
-        $command = Get-Command -Name $commandName -ErrorAction SilentlyContinue
-        if ($null -ne $command) {
-            return $command
-        }
-    }
-
-    return $null
 }
 
 # Returns the PAC CLI command if available in PATH.
@@ -1000,6 +1044,11 @@ function Parse-PacCopilotListOutput {
             continue
         }
 
+        # Never parse PAC errors/warnings as agent rows.
+        if ($trimmed -match "^(?i)(error:|warning:|invalid value|failed|exception|the value passed to '--environment')") {
+            continue
+        }
+
         if ($trimmed -match "^(Connected as|Connected to\.\.\.|Microsoft PowerPlatform CLI|Version:|Online documentation:|Feedback, Suggestions, Issues:|Name\s+Copilot ID|---+)") {
             continue
         }
@@ -1019,6 +1068,68 @@ function Parse-PacCopilotListOutput {
     }
 
     return $records
+}
+
+# Gets PAC copilot rows for an environment using several argument formats.
+function Get-PacCopilotAgentsForEnvironment {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$EnvironmentId,
+
+        [Parameter(Mandatory = $false)]
+        [string]$InstanceUrl,
+
+        [Parameter(Mandatory = $false)]
+        [string]$EnvironmentDisplayName
+    )
+
+    $candidateEnvironmentValues = [System.Collections.Generic.List[string]]::new()
+
+    if (-not [string]::IsNullOrWhiteSpace($InstanceUrl)) {
+        $candidateEnvironmentValues.Add($InstanceUrl.TrimEnd('/')) | Out-Null
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($EnvironmentId)) {
+        $candidateEnvironmentValues.Add($EnvironmentId) | Out-Null
+
+        if ($EnvironmentId -match "(?i)^Default-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$") {
+            $candidateEnvironmentValues.Add($matches[1]) | Out-Null
+        }
+    }
+
+    # De-duplicate while preserving order.
+    $seen = @{}
+    $orderedCandidates = @()
+    foreach ($candidate in $candidateEnvironmentValues) {
+        $key = $candidate.ToLowerInvariant()
+        if (-not $seen.ContainsKey($key)) {
+            $seen[$key] = $true
+            $orderedCandidates += $candidate
+        }
+    }
+
+    foreach ($candidate in $orderedCandidates) {
+        $output = Invoke-PacCommandSafe -Arguments @("copilot", "list", "--environment", $candidate)
+        $records = @(Parse-PacCopilotListOutput -OutputText $output)
+        if ($records.Count -gt 0) {
+            return $records
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($output) -and $output -match "(?i)(error:|the value passed to '--environment' is invalid|no dataverse organization was found)") {
+            Write-Warning "PAC agent lookup failed for environment '$EnvironmentDisplayName' using '--environment $candidate'."
+
+            $pacErrorLine = ($output -split "`r?`n" | Where-Object { $_ -match "(?i)error:|no dataverse organization was found|the value passed to '--environment' is invalid" } | Select-Object -First 1)
+            if ([string]::IsNullOrWhiteSpace($pacErrorLine)) {
+                $pacErrorLine = "PAC agent lookup failed for '--environment $candidate'."
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($EnvironmentDisplayName)) {
+                Add-EnvironmentAccessIssue -Environment $EnvironmentDisplayName -Stage "PacCopilotList" -Message $pacErrorLine
+            }
+        }
+    }
+
+    return @()
 }
 
 # Finds the first supported PowerShell cmdlet for listing environments.
@@ -1161,6 +1272,8 @@ $flowCount = 0
 $appCount = 0
 $agentCount = 0
 $environmentUrlById = @{}
+$script:environmentAccessIssues = [System.Collections.Generic.List[object]]::new()
+$script:environmentAccessIssueKeys = [System.Collections.Generic.HashSet[string]]::new()
 
 foreach ($environment in $environments) {
     $mappedEnvironmentId = [string](Get-ValueByPath -InputObject $environment -Paths @("EnvironmentName", "Name", "Id"))
@@ -1170,35 +1283,17 @@ foreach ($environment in $environments) {
     }
 }
 
-$agentCommand = Get-AgentCommand
 $pacCommand = Get-PacCommand
-$agentCommandName = $null
-$agentSupportsEnvironment = $false
-$agentEnvParameter = $null
 $usePacFallbackForAgents = $false
 $pacFallbackOwnerDateMissingWarningShown = $false
 
-# Decide whether to use native agent cmdlets or PAC CLI fallback.
-if ($null -ne $agentCommand) {
-    $agentCommandName = $agentCommand.Name
-    foreach ($parameterName in @("EnvironmentName", "EnvironmentId")) {
-        if ($agentCommand.Parameters.ContainsKey($parameterName)) {
-            $agentSupportsEnvironment = $true
-            $agentEnvParameter = $parameterName
-            break
-        }
-    }
-
-    Write-Host "Using agent command: $agentCommandName" -ForegroundColor DarkCyan
+# Agent inventory is collected through PAC/Dataverse path.
+if ($null -ne $pacCommand) {
+    $usePacFallbackForAgents = $true
+    Write-Host "Using PAC-based agent discovery path (Dataverse first unless -SkipAgentDataverseQuery is set)." -ForegroundColor DarkCyan
 }
 else {
-    if ($null -ne $pacCommand) {
-        $usePacFallbackForAgents = $true
-        Write-Host "No supported PowerShell agent cmdlet was found. Using 'pac copilot list' for agent inventory." -ForegroundColor DarkYellow
-    }
-    else {
-        Write-Warning "No supported agent command was found (PowerShell or PAC CLI). Agent inventory will be skipped."
-    }
+    Write-Warning "PAC CLI was not found in PATH. Agent inventory will be skipped."
 }
 
 # Iterate environments and collect Flow/App/Agent artifacts.
@@ -1257,6 +1352,7 @@ foreach ($environment in $environments) {
     }
     catch {
         Write-Warning "Failed to collect flows for environment '$environmentDisplayName'. $($_.Exception.Message)"
+        Add-EnvironmentAccessIssue -Environment $environmentDisplayName -Stage "Flows" -Message $_.Exception.Message
     }
 
     try {
@@ -1298,65 +1394,43 @@ foreach ($environment in $environments) {
     }
     catch {
         Write-Warning "Failed to collect apps for environment '$environmentDisplayName'. $($_.Exception.Message)"
-    }
-
-    if ($null -ne $agentCommand -and $agentSupportsEnvironment) {
-        try {
-            $agentArgs = @{}
-            $agentArgs[$agentEnvParameter] = $environmentId
-            $agents = & $agentCommandName @agentArgs
-
-            foreach ($agent in $agents) {
-                $ownerEmail = [string](Resolve-OwnerEmail -Item $agent)
-                $ownerDisplay = [string](Resolve-OwnerDisplayName -Item $agent)
-                $ownerGuid = Get-AgentOwnerGuidFromItem -Item $agent
-
-                if ([string]::IsNullOrWhiteSpace($ownerEmail) -and -not [string]::IsNullOrWhiteSpace($ownerGuid)) {
-                    $ownerEmail = [string](Resolve-EntraEmailFromObjectId -ObjectId $ownerGuid)
-                }
-
-                $ownerValue = Resolve-OwnerField -OwnerDisplayName $ownerDisplay -OwnerEmail $ownerEmail
-                if ([string]::IsNullOrWhiteSpace($ownerValue) -and -not [string]::IsNullOrWhiteSpace($ownerGuid)) {
-                    $ownerValue = $ownerGuid
-                }
-
-                $guid = [string](Get-ValueByPath -InputObject $agent -Paths @("BotId", "CopilotId", "AgentId", "Name", "Id"))
-                $artifactName = [string](Get-ValueByPath -InputObject $agent -Paths @("DisplayName", "Name", "properties.displayName", "BotName"))
-                $created = Convert-ToIsoDate (Get-ValueByPath -InputObject $agent -Paths @("CreatedTime", "CreatedDateTime", "properties.createdTime", "properties.createdDateTime", "CreatedOn"))
-                $connectionReferences = $null
-                $connectionReferenceCount = 0
-
-                if ($IncludeConnectionReferences) {
-                    $agentRefSummary = Get-ConnectionReferencesFromItem -Item $agent
-                    if ($agentRefSummary.Count -gt 0) {
-                        $connectionReferences = [string]$agentRefSummary.List
-                        $connectionReferenceCount = [int]$agentRefSummary.Count
-                    }
-                    else {
-                        $agentToolSummary = Get-AgentToolSummary -EnvironmentUrl $environmentInstanceUrl -AgentId $guid
-                        $connectionReferences = [string]$agentToolSummary.List
-                        $connectionReferenceCount = [int]$agentToolSummary.Count
-                    }
-                }
-
-                Add-InventoryRecord -Buffer $inventory -ArtifactType "Agent" -Environment $environmentDisplayName -EnvironmentId $environmentId -Guid $guid -ArtifactName $artifactName -Owner $ownerValue -OwnerEmail $ownerEmail -OwnerObjectId $ownerGuid -DateCreated $created -ConnectionReferences $connectionReferences -ConnectionReferenceCount $connectionReferenceCount
-                $agentCount++
-            }
-        }
-        catch {
-            Write-Warning "Failed to collect agents for environment '$environmentDisplayName'. $($_.Exception.Message)"
-        }
+        Add-EnvironmentAccessIssue -Environment $environmentDisplayName -Stage "Apps" -Message $_.Exception.Message
     }
 
     if ($usePacFallbackForAgents) {
         try {
             $instanceUrl = [string](Get-ValueByPath -InputObject $environment -Paths @("Internal.properties.linkedEnvironmentMetadata.instanceUrl"))
-            if ([string]::IsNullOrWhiteSpace($instanceUrl)) {
+                if ([string]::IsNullOrWhiteSpace($instanceUrl) -and -not $SkipAgentDataverseQuery) {
                 continue
             }
 
-            $dataverseBots = @(Get-DataverseBots -InstanceUrl $instanceUrl)
-            $dvEnrichmentAvailable = @($dataverseBots).Count -gt 0
+                if ($SkipAgentDataverseQuery) {
+                    Write-Host "Strict PAC mode for environment '$environmentDisplayName': skipping all Dataverse-based agent queries." -ForegroundColor DarkYellow
+
+                    $pacAgents = @(Get-PacCopilotAgentsForEnvironment -EnvironmentId $environmentId -InstanceUrl $instanceUrl -EnvironmentDisplayName $environmentDisplayName)
+
+                    foreach ($pacAgent in $pacAgents) {
+                        $agentGuid = [string]$pacAgent.CopilotId
+                        $agentName = [string]$pacAgent.Name
+
+                        # Strict mode: do not call Dataverse for tools/owner/date enrichment.
+                        $connectionReferences = $null
+                        $connectionReferenceCount = 0
+
+                        Add-InventoryRecord -Buffer $inventory -ArtifactType "Agent" -Environment $environmentDisplayName -EnvironmentId $environmentId -Guid $agentGuid -ArtifactName $agentName -Owner $null -OwnerEmail $null -OwnerObjectId $null -DateCreated $null -ConnectionReferences $connectionReferences -ConnectionReferenceCount $connectionReferenceCount
+                        $agentCount++
+                    }
+
+                    if (@($pacAgents).Count -eq 0 -and -not $pacFallbackOwnerDateMissingWarningShown) {
+                        Write-Warning "PAC fallback returned zero agents for environment '$environmentDisplayName'."
+                        $pacFallbackOwnerDateMissingWarningShown = $true
+                    }
+
+                    continue
+                }
+
+            $dataverseBots = @(Get-DataverseBots -InstanceUrl $instanceUrl -EnvironmentDisplayName $environmentDisplayName)
+            $dataverseAgentCount = @($dataverseBots).Count
 
             foreach ($agent in $dataverseBots) {
                 $agentGuid = [string]$agent.BotId
@@ -1387,77 +1461,65 @@ foreach ($environment in $environments) {
                 $agentCount++
             }
 
-            if (-not $dvEnrichmentAvailable -and -not $pacFallbackOwnerDateMissingWarningShown) {
-                Write-Warning "Dataverse fallback agent inventory was not available (Az.Accounts module with active login may be required). Agent artifacts may be missing."
-                $pacFallbackOwnerDateMissingWarningShown = $true
+            # If Dataverse returned no agents for this environment, retry using PAC CLI fallback.
+            if ($dataverseAgentCount -eq 0) {
+                Write-Warning "Dataverse agent discovery returned zero agents for environment '$environmentDisplayName'. Trying PAC fallback."
+
+                $pacAgents = @(Get-PacCopilotAgentsForEnvironment -EnvironmentId $environmentId -InstanceUrl $instanceUrl -EnvironmentDisplayName $environmentDisplayName)
+                $botOwnerMap = Get-DataverseBotOwnerMap -InstanceUrl $instanceUrl -EnvironmentDisplayName $environmentDisplayName
+
+                foreach ($pacAgent in $pacAgents) {
+                    $agentGuid = [string]$pacAgent.CopilotId
+                    $agentName = [string]$pacAgent.Name
+                    $mapKey = if ([string]::IsNullOrWhiteSpace($agentGuid)) { $null } else { $agentGuid.ToLowerInvariant() }
+
+                    $ownerObjectId = $null
+                    $ownerDisplayName = $null
+                    $created = $null
+
+                    if (-not [string]::IsNullOrWhiteSpace($mapKey) -and $botOwnerMap.ContainsKey($mapKey)) {
+                        $ownerObjectId = [string]$botOwnerMap[$mapKey].OwnerSystemUserId
+                        $ownerDisplayName = [string]$botOwnerMap[$mapKey].OwnerDisplayName
+                        $created = Convert-ToIsoDate $botOwnerMap[$mapKey].CreatedOn
+                    }
+
+                    $ownerEmail = $null
+                    if (-not [string]::IsNullOrWhiteSpace($ownerObjectId)) {
+                        $ownerEmail = Resolve-DataverseSystemUserEmail -InstanceUrl $instanceUrl -SystemUserId $ownerObjectId
+                    }
+
+                    $ownerValue = Resolve-OwnerField -OwnerDisplayName $ownerDisplayName -OwnerEmail $ownerEmail
+                    if ([string]::IsNullOrWhiteSpace($ownerValue) -and -not [string]::IsNullOrWhiteSpace($ownerObjectId)) {
+                        $ownerValue = $ownerObjectId
+                    }
+
+                    $connectionReferences = $null
+                    $connectionReferenceCount = 0
+                    if ($IncludeConnectionReferences) {
+                        $agentToolSummary = Get-AgentToolSummary -EnvironmentUrl $instanceUrl -AgentId $agentGuid
+                        $connectionReferences = [string]$agentToolSummary.List
+                        $connectionReferenceCount = [int]$agentToolSummary.Count
+                    }
+
+                    Add-InventoryRecord -Buffer $inventory -ArtifactType "Agent" -Environment $environmentDisplayName -EnvironmentId $environmentId -Guid $agentGuid -ArtifactName $agentName -Owner $ownerValue -OwnerEmail $ownerEmail -OwnerObjectId $ownerObjectId -DateCreated $created -ConnectionReferences $connectionReferences -ConnectionReferenceCount $connectionReferenceCount
+                    $agentCount++
+                }
+
+                if (@($pacAgents).Count -eq 0 -and -not $pacFallbackOwnerDateMissingWarningShown) {
+                    Write-Warning "PAC fallback returned zero agents for environment '$environmentDisplayName' after Dataverse returned zero."
+                    $pacFallbackOwnerDateMissingWarningShown = $true
+                }
             }
+
         }
         catch {
             Write-Warning "Failed to collect agents through Dataverse fallback for environment '$environmentDisplayName'. $($_.Exception.Message)"
+            Add-EnvironmentAccessIssue -Environment $environmentDisplayName -Stage "Agents" -Message $_.Exception.Message
         }
     }
 }
 
 Write-Progress -Activity "Collecting Power Platform inventory" -Completed
-
-# Handle agent cmdlets that only support tenant-level enumeration (no environment filter).
-if ($null -ne $agentCommand -and -not $agentSupportsEnvironment) {
-    try {
-        $agents = & $agentCommandName
-
-        foreach ($agent in $agents) {
-            $environmentDisplayName = [string](Get-ValueByPath -InputObject $agent -Paths @("EnvironmentDisplayName", "EnvironmentName", "EnvironmentId"))
-            $environmentId = [string](Get-ValueByPath -InputObject $agent -Paths @("EnvironmentName", "EnvironmentId"))
-
-            if ([string]::IsNullOrWhiteSpace($environmentDisplayName)) {
-                $environmentDisplayName = $environmentId
-            }
-
-            $ownerEmail = [string](Resolve-OwnerEmail -Item $agent)
-            $ownerDisplay = [string](Resolve-OwnerDisplayName -Item $agent)
-            $ownerGuid = Get-AgentOwnerGuidFromItem -Item $agent
-
-            if ([string]::IsNullOrWhiteSpace($ownerEmail) -and -not [string]::IsNullOrWhiteSpace($ownerGuid)) {
-                $ownerEmail = [string](Resolve-EntraEmailFromObjectId -ObjectId $ownerGuid)
-            }
-
-            $ownerValue = Resolve-OwnerField -OwnerDisplayName $ownerDisplay -OwnerEmail $ownerEmail
-            if ([string]::IsNullOrWhiteSpace($ownerValue) -and -not [string]::IsNullOrWhiteSpace($ownerGuid)) {
-                $ownerValue = $ownerGuid
-            }
-
-            $guid = [string](Get-ValueByPath -InputObject $agent -Paths @("BotId", "CopilotId", "AgentId", "Name", "Id"))
-            $artifactName = [string](Get-ValueByPath -InputObject $agent -Paths @("DisplayName", "Name", "properties.displayName", "BotName"))
-            $created = Convert-ToIsoDate (Get-ValueByPath -InputObject $agent -Paths @("CreatedTime", "CreatedDateTime", "properties.createdTime", "properties.createdDateTime", "CreatedOn"))
-            $connectionReferences = $null
-            $connectionReferenceCount = 0
-
-            if ($IncludeConnectionReferences) {
-                $agentRefSummary = Get-ConnectionReferencesFromItem -Item $agent
-                if ($agentRefSummary.Count -gt 0) {
-                    $connectionReferences = [string]$agentRefSummary.List
-                    $connectionReferenceCount = [int]$agentRefSummary.Count
-                }
-                else {
-                    $agentEnvUrl = $null
-                    if (-not [string]::IsNullOrWhiteSpace($environmentId) -and $environmentUrlById.ContainsKey($environmentId)) {
-                        $agentEnvUrl = [string]$environmentUrlById[$environmentId]
-                    }
-
-                    $agentToolSummary = Get-AgentToolSummary -EnvironmentUrl $agentEnvUrl -AgentId $guid
-                    $connectionReferences = [string]$agentToolSummary.List
-                    $connectionReferenceCount = [int]$agentToolSummary.Count
-                }
-            }
-
-            Add-InventoryRecord -Buffer $inventory -ArtifactType "Agent" -Environment $environmentDisplayName -EnvironmentId $environmentId -Guid $guid -ArtifactName $artifactName -Owner $ownerValue -OwnerEmail $ownerEmail -OwnerObjectId $ownerGuid -DateCreated $created -ConnectionReferences $connectionReferences -ConnectionReferenceCount $connectionReferenceCount
-            $agentCount++
-        }
-    }
-    catch {
-        Write-Warning "Failed to collect agents with command '$agentCommandName'. $($_.Exception.Message)"
-    }
-}
 
 # Ensure output directory exists, then export a stable, sorted CSV.
 $outputDirectory = Split-Path -Path $OutputCsvPath -Parent
@@ -1503,3 +1565,11 @@ Write-Host "Apps:   $appCount" -ForegroundColor Green
 Write-Host "Agents: $agentCount" -ForegroundColor Green
 Write-Host "Total:  $($inventory.Count)" -ForegroundColor Green
 Write-Host "CSV:    $OutputCsvPath" -ForegroundColor Green
+
+if ($script:environmentAccessIssues.Count -gt 0) {
+    Write-Host "" 
+    Write-Host "Environment access issues:" -ForegroundColor Yellow
+    foreach ($issue in ($script:environmentAccessIssues | Sort-Object -Property Environment, Stage, Message)) {
+        Write-Host ("- {0} [{1}]: {2}" -f $issue.Environment, $issue.Stage, $issue.Message) -ForegroundColor Yellow
+    }
+}
