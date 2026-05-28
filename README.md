@@ -17,6 +17,13 @@ For each environment, the script attempts to collect:
 
 It also enriches owner details and creation timestamps when available, and can optionally include connection references and agent tool/action summaries.
 
+## Recent updates (2026-05-28)
+
+- Agent discovery now runs PAC first (`pac copilot list`) for every environment.
+- Dataverse is now used as an enrichment layer for PAC agent rows (owner, owner email, creation date, and optional tool/action details).
+- If PAC returns zero agents and Dataverse is available, the script falls back to Dataverse-only agent inventory for that environment.
+- If Dataverse is unavailable or fails, PAC agent rows are still written without Dataverse-derived enrichment.
+
 ## Requirements
 
 The script can install missing modules automatically unless -SkipModuleInstall is used.
@@ -28,7 +35,7 @@ Commonly used modules/cmdlets:
 - Az.Accounts
 - Microsoft.Graph.Authentication
 - Microsoft.Graph.Users
-- pac (Power Platform CLI, optional fallback path)
+- pac (Power Platform CLI, primary path for agent discovery)
 -- Make sure to install from https://learn.microsoft.com/en-us/power-platform/developer/cli/introduction?tabs=windows
 
 ## Required Permissions
@@ -84,7 +91,7 @@ Disable automatic module installation:
 .\Get-M365PowerPlatformInventory.ps1 -SkipModuleInstall
 ```
 
-Skip Dataverse agent discovery and use PAC CLI directly for agent discovery:
+Skip Dataverse enrichment and run strict PAC-only agent inventory:
 
 ```powershell
 .\Get-M365PowerPlatformInventory.ps1 -SkipAgentDataverseQuery
@@ -93,9 +100,9 @@ Skip Dataverse agent discovery and use PAC CLI directly for agent discovery:
 When `-SkipAgentDataverseQuery` is used, agent discovery runs in strict PAC mode:
 
 - Agent rows are sourced from `pac copilot list` only
-- Dataverse-based agent discovery/enrichment queries are skipped
+- Dataverse-based enrichment queries are skipped
 - Owner/owner-email/date fields for Agents may be reduced or blank when PAC output does not expose that metadata
-- If `-IncludeConnectionReferences` is also used, agent tool/action extraction may still return data when the PAC/template path succeeds
+- If `-IncludeConnectionReferences` is also used, agent tool/action extraction is skipped in strict PAC mode (no Dataverse enrichment)
 
 Process only a specific environment by GUID:
 
@@ -273,5 +280,5 @@ This error appears in the CSV output when the script encounters a security/permi
 ## Notes
 
 - Some fields can be blank due to API limitations, missing permissions, or unavailable enrichment paths.
-- Agent collection may use PAC CLI fallback when no supported Agent PowerShell cmdlet is available.
+- Agent collection uses PAC CLI as the primary source and Dataverse as an enrichment/fallback layer.
 - CSV outputs are intentionally ignored by git in this repository.

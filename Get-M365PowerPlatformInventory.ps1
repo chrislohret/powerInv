@@ -1290,7 +1290,7 @@ $pacFallbackOwnerDateMissingWarningShown = $false
 # Agent inventory is collected through PAC/Dataverse path.
 if ($null -ne $pacCommand) {
     $usePacFallbackForAgents = $true
-    Write-Host "Using PAC-based agent discovery path (Dataverse first unless -SkipAgentDataverseQuery is set)." -ForegroundColor DarkCyan
+    Write-Host "Using PAC-based agent discovery path (PAC first, Dataverse enrichment unless -SkipAgentDataverseQuery is set)." -ForegroundColor DarkCyan
 }
 else {
     Write-Warning "PAC CLI was not found in PATH. Agent inventory will be skipped."
@@ -1400,9 +1400,6 @@ foreach ($environment in $environments) {
     if ($usePacFallbackForAgents) {
         try {
             $instanceUrl = [string](Get-ValueByPath -InputObject $environment -Paths @("Internal.properties.linkedEnvironmentMetadata.instanceUrl"))
-                if ([string]::IsNullOrWhiteSpace($instanceUrl) -and -not $SkipAgentDataverseQuery) {
-                continue
-            }
 
                 if ($SkipAgentDataverseQuery) {
                     Write-Host "Strict PAC mode for environment '$environmentDisplayName': skipping all Dataverse-based agent queries." -ForegroundColor DarkYellow
@@ -1429,17 +1426,58 @@ foreach ($environment in $environments) {
                     continue
                 }
 
-            $dataverseBots = @(Get-DataverseBots -InstanceUrl $instanceUrl -EnvironmentDisplayName $environmentDisplayName)
-            $dataverseAgentCount = @($dataverseBots).Count
+            $pacAgents = @(Get-PacCopilotAgentsForEnvironment -EnvironmentId $environmentId -InstanceUrl $instanceUrl -EnvironmentDisplayName $environmentDisplayName)
 
-            foreach ($agent in $dataverseBots) {
-                $agentGuid = [string]$agent.BotId
+            $botOwnerMap = @{}
+            $dataverseBotsById = @{}
+            $dataverseQuerySucceeded = $false
+
+            if ([string]::IsNullOrWhiteSpace($instanceUrl)) {
+                Write-Warning "Dataverse instance URL not available for environment '$environmentDisplayName'. PAC agents will be returned without Dataverse enrichment."
+            }
+            else {
+                try {
+                    $botOwnerMap = Get-DataverseBotOwnerMap -InstanceUrl $instanceUrl -EnvironmentDisplayName $environmentDisplayName
+                    $dataverseBots = @(Get-DataverseBots -InstanceUrl $instanceUrl -EnvironmentDisplayName $environmentDisplayName)
+                    $dataverseQuerySucceeded = $true
+
+                    foreach ($dataverseBot in $dataverseBots) {
+                        $dataverseBotId = [string]$dataverseBot.BotId
+                        if ([string]::IsNullOrWhiteSpace($dataverseBotId)) {
+                            continue
+                        }
+
+                        $dataverseBotsById[$dataverseBotId.ToLowerInvariant()] = $dataverseBot
+                    }
+                }
+                catch {
+                    Write-Warning "Dataverse enrichment failed for environment '$environmentDisplayName'. Continuing with PAC-only agent details. $($_.Exception.Message)"
+                }
+            }
+
+            foreach ($pacAgent in $pacAgents) {
+                $agentGuid = [string]$pacAgent.CopilotId
+                $agentName = [string]$pacAgent.Name
+                $agentMapKey = if ([string]::IsNullOrWhiteSpace($agentGuid)) { $null } else { $agentGuid.ToLowerInvariant() }
+
+                $ownerObjectId = $null
+                $ownerDisplayName = $null
+                $created = $null
+
+                if (-not [string]::IsNullOrWhiteSpace($agentMapKey) -and $dataverseBotsById.ContainsKey($agentMapKey)) {
+                    $matchedDataverseBot = $dataverseBotsById[$agentMapKey]
+                    $ownerObjectId = [string]$matchedDataverseBot.OwnerSystemUserId
+                    $ownerDisplayName = [string]$matchedDataverseBot.OwnerDisplayName
+                    $created = Convert-ToIsoDate $matchedDataverseBot.CreatedOn
+                }
+                elseif (-not [string]::IsNullOrWhiteSpace($agentMapKey) -and $botOwnerMap.ContainsKey($agentMapKey)) {
+                    $ownerObjectId = [string]$botOwnerMap[$agentMapKey].OwnerSystemUserId
+                    $ownerDisplayName = [string]$botOwnerMap[$agentMapKey].OwnerDisplayName
+                    $created = Convert-ToIsoDate $botOwnerMap[$agentMapKey].CreatedOn
+                }
+
                 $ownerEmail = $null
-                $ownerDisplayName = [string]$agent.OwnerDisplayName
-                $ownerObjectId = [string]$agent.OwnerSystemUserId
-                $created = Convert-ToIsoDate $agent.CreatedOn
-
-                if (-not [string]::IsNullOrWhiteSpace($ownerObjectId)) {
+                if (-not [string]::IsNullOrWhiteSpace($ownerObjectId) -and -not [string]::IsNullOrWhiteSpace($instanceUrl)) {
                     $ownerEmail = Resolve-DataverseSystemUserEmail -InstanceUrl $instanceUrl -SystemUserId $ownerObjectId
                 }
 
@@ -1450,40 +1488,27 @@ foreach ($environment in $environments) {
 
                 $connectionReferences = $null
                 $connectionReferenceCount = 0
-
-                if ($IncludeConnectionReferences) {
+                if ($IncludeConnectionReferences -and -not [string]::IsNullOrWhiteSpace($instanceUrl) -and -not [string]::IsNullOrWhiteSpace($agentGuid)) {
                     $agentToolSummary = Get-AgentToolSummary -EnvironmentUrl $instanceUrl -AgentId $agentGuid
                     $connectionReferences = [string]$agentToolSummary.List
                     $connectionReferenceCount = [int]$agentToolSummary.Count
                 }
 
-                Add-InventoryRecord -Buffer $inventory -ArtifactType "Agent" -Environment $environmentDisplayName -EnvironmentId $environmentId -Guid $agentGuid -ArtifactName ([string]$agent.Name) -Owner $ownerValue -OwnerEmail $ownerEmail -OwnerObjectId $ownerObjectId -DateCreated $created -ConnectionReferences $connectionReferences -ConnectionReferenceCount $connectionReferenceCount
+                Add-InventoryRecord -Buffer $inventory -ArtifactType "Agent" -Environment $environmentDisplayName -EnvironmentId $environmentId -Guid $agentGuid -ArtifactName $agentName -Owner $ownerValue -OwnerEmail $ownerEmail -OwnerObjectId $ownerObjectId -DateCreated $created -ConnectionReferences $connectionReferences -ConnectionReferenceCount $connectionReferenceCount
                 $agentCount++
             }
 
-            # If Dataverse returned no agents for this environment, retry using PAC CLI fallback.
-            if ($dataverseAgentCount -eq 0) {
-                Write-Warning "Dataverse agent discovery returned zero agents for environment '$environmentDisplayName'. Trying PAC fallback."
+            if (@($pacAgents).Count -eq 0 -and $dataverseQuerySucceeded) {
+                Write-Warning "PAC returned zero agents for environment '$environmentDisplayName'. Falling back to Dataverse-only agent inventory."
 
-                $pacAgents = @(Get-PacCopilotAgentsForEnvironment -EnvironmentId $environmentId -InstanceUrl $instanceUrl -EnvironmentDisplayName $environmentDisplayName)
-                $botOwnerMap = Get-DataverseBotOwnerMap -InstanceUrl $instanceUrl -EnvironmentDisplayName $environmentDisplayName
-
-                foreach ($pacAgent in $pacAgents) {
-                    $agentGuid = [string]$pacAgent.CopilotId
-                    $agentName = [string]$pacAgent.Name
-                    $mapKey = if ([string]::IsNullOrWhiteSpace($agentGuid)) { $null } else { $agentGuid.ToLowerInvariant() }
-
-                    $ownerObjectId = $null
-                    $ownerDisplayName = $null
-                    $created = $null
-
-                    if (-not [string]::IsNullOrWhiteSpace($mapKey) -and $botOwnerMap.ContainsKey($mapKey)) {
-                        $ownerObjectId = [string]$botOwnerMap[$mapKey].OwnerSystemUserId
-                        $ownerDisplayName = [string]$botOwnerMap[$mapKey].OwnerDisplayName
-                        $created = Convert-ToIsoDate $botOwnerMap[$mapKey].CreatedOn
-                    }
-
+                $dataverseBots = @($dataverseBotsById.Values)
+                foreach ($agent in $dataverseBots) {
+                    $agentGuid = [string]$agent.BotId
                     $ownerEmail = $null
+                    $ownerDisplayName = [string]$agent.OwnerDisplayName
+                    $ownerObjectId = [string]$agent.OwnerSystemUserId
+                    $created = Convert-ToIsoDate $agent.CreatedOn
+
                     if (-not [string]::IsNullOrWhiteSpace($ownerObjectId)) {
                         $ownerEmail = Resolve-DataverseSystemUserEmail -InstanceUrl $instanceUrl -SystemUserId $ownerObjectId
                     }
@@ -1495,25 +1520,37 @@ foreach ($environment in $environments) {
 
                     $connectionReferences = $null
                     $connectionReferenceCount = 0
+
                     if ($IncludeConnectionReferences) {
                         $agentToolSummary = Get-AgentToolSummary -EnvironmentUrl $instanceUrl -AgentId $agentGuid
                         $connectionReferences = [string]$agentToolSummary.List
                         $connectionReferenceCount = [int]$agentToolSummary.Count
                     }
 
-                    Add-InventoryRecord -Buffer $inventory -ArtifactType "Agent" -Environment $environmentDisplayName -EnvironmentId $environmentId -Guid $agentGuid -ArtifactName $agentName -Owner $ownerValue -OwnerEmail $ownerEmail -OwnerObjectId $ownerObjectId -DateCreated $created -ConnectionReferences $connectionReferences -ConnectionReferenceCount $connectionReferenceCount
+                    Add-InventoryRecord -Buffer $inventory -ArtifactType "Agent" -Environment $environmentDisplayName -EnvironmentId $environmentId -Guid $agentGuid -ArtifactName ([string]$agent.Name) -Owner $ownerValue -OwnerEmail $ownerEmail -OwnerObjectId $ownerObjectId -DateCreated $created -ConnectionReferences $connectionReferences -ConnectionReferenceCount $connectionReferenceCount
                     $agentCount++
                 }
+            }
 
-                if (@($pacAgents).Count -eq 0 -and -not $pacFallbackOwnerDateMissingWarningShown) {
-                    Write-Warning "PAC fallback returned zero agents for environment '$environmentDisplayName' after Dataverse returned zero."
+            if (@($pacAgents).Count -eq 0 -and -not $pacFallbackOwnerDateMissingWarningShown) {
+                $zeroAgentWarningMessage = $null
+
+                if ($dataverseQuerySucceeded -and @($dataverseBotsById.Values).Count -eq 0) {
+                    $zeroAgentWarningMessage = "PAC and Dataverse agent discovery both returned zero agents for environment '$environmentDisplayName'."
+                }
+                elseif (-not $dataverseQuerySucceeded) {
+                    $zeroAgentWarningMessage = "PAC returned zero agents for environment '$environmentDisplayName', and Dataverse enrichment was unavailable or failed."
+                }
+
+                if (-not [string]::IsNullOrWhiteSpace($zeroAgentWarningMessage)) {
+                    Write-Warning $zeroAgentWarningMessage
                     $pacFallbackOwnerDateMissingWarningShown = $true
                 }
             }
 
         }
         catch {
-            Write-Warning "Failed to collect agents through Dataverse fallback for environment '$environmentDisplayName'. $($_.Exception.Message)"
+            Write-Warning "Failed to collect agents through PAC/Dataverse agent path for environment '$environmentDisplayName'. $($_.Exception.Message)"
             Add-EnvironmentAccessIssue -Environment $environmentDisplayName -Stage "Agents" -Message $_.Exception.Message
         }
     }
